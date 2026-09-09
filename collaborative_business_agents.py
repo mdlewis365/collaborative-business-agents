@@ -110,7 +110,6 @@ class WorkflowState:
             fields = ("leave_type", "requested_days", "daily_cost")
             if any(self.approval_state[key] != new_state[key] for key in fields):
                 raise ValueError("A different request is already saved in this workflow.")
-            # An identical retry must not reset a manager's decision.
         else:
             self.approval_state.update(new_state)
         return json.dumps({"saved": True, "approval_state": self.approval_state})
@@ -222,7 +221,6 @@ class FinanceProtocolAgent(BaseChatAgent):
         if not isinstance(message, TextMessage):
             raise WorkflowError("Finance must return a text report.")
 
-        # Preserve an explicit blocked result; do not turn an error into success.
         match = LABEL_PATTERN.match(message.content)
         if match and match.group("status").strip() == "Blocked":
             return response
