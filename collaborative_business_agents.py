@@ -1,23 +1,50 @@
+"""Leave-processing workflow for Microsoft AutoGen 0.7.5.
+
+Install in the Python environment used to run this file:
+    python -m pip install "autogen-agentchat==0.7.5" "autogen-ext[openai]==0.7.5" python-dotenv
+
+Keep a .env file beside this script containing:
+    AZURE_OPENAI_API_KEY=<your key>
+    AZURE_OPENAI_ENDPOINT=<your Azure OpenAI resource endpoint>
+    AZURE_OPENAI_DEPLOYMENT=<your deployment name>
+    API_VERSION=<the API version for your deployment>
+    AZURE_OPENAI_MODEL=<the underlying model name, if different from deployment>
+
+AZURE_OPENAI_API_VERSION is also accepted when API_VERSION is not supplied.
+Use a deployment that supports tool calling. Deployment names and model names
+are different concepts: a deployment named hr-model might host gpt-4o.
+
+Create a new LeaveWorkflow instance for each employee request. The request's
+state is available as workflow.state.approval_state after await workflow.run().
+This is an in-memory console example; it does not update an HR database.
+"""
+
+import asyncio
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+import json
+import math
 import os
-from dotenv import load_dotenv
-from autogen import AssistantAgent, UserProxyAgent, GroupChatManager, GroupChat
+from pathlib import Path
 import re
+from typing import Any
 
-load_dotenv()
-OPENAI_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-API_VERSION = os.getenv("API_VERSION")
-AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+from autogen_agentchat.agents import AssistantAgent, BaseChatAgent, UserProxyAgent
+from autogen_agentchat.base import Response, TaskResult
+from autogen_agentchat.conditions import FunctionalTermination
+from autogen_agentchat.messages import BaseAgentEvent, BaseChatMessage, TextMessage
+from autogen_agentchat.teams import SelectorGroupChat
+from autogen_agentchat.ui import Console
+from autogen_core import CancellationToken
+from autogen_core.models import ChatCompletionClient
+from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
+from dotenv import load_dotenv
 
-llm_config = {
-    "config_list": [{
-            "api_type": "azure",
-        	"api_version": API_VERSION,
-        	"api_key": OPENAI_KEY,
-        	"base_url": OPENAI_ENDPOINT,
-            "model": AZURE_OPENAI_DEPLOYMENT
-}]
-}
+
+APPROVAL_COST_THRESHOLD = 1500.00
+SPECIAL_LEAVE_TYPES = {"extended leave", "unpaid leave", "policy exception"}
+HR_COMPLETE_SENTENCE = "HR complete, please continue."
+PAUSE_MESSAGE = "Manager Approval Needed - Task Paused"
 
 LABEL_PATTERN = re.compile(
     r"^\[From:\s*(?P<sender>[^\]]+)\]"
@@ -25,377 +52,478 @@ LABEL_PATTERN = re.compile(
     r"\[Status:\s*(?P<status>[^\]]+)\]"
     r"\[Next:\s*(?P<next_agent>[^\]]+)\]"
 )
+HR_POLICY_PATTERN = re.compile(
+    r"^HR policy check: (PASSED|FAILED)\s*$", re.MULTILINE
+)
 
-def parse_labels(content):
 
-    match = LABEL_PATTERN.match(str(content).strip())
+class WorkflowError(ValueError):
+    """The workflow cannot proceed with the supplied data or message."""
 
-    if not match:
-        raise ValueError(
-            "Message must begin with "
-            "[From: ...][Task: ...][Status: ...][Next: ...]"
+
+def parse_labels(content: str) -> dict[str, str]:
+    match = LABEL_PATTERN.match(content)
+    if match is None:
+        raise WorkflowError(
+            "The message must start with "
+            "[From: ...][Task: ...][Status: ...][Next: ...]."
         )
+    return {key: value.strip() for key, value in match.groupdict().items()}
 
-    return match.groupdict()
-
-APPROVAL_COST_THRESHOLD = 1500.00
-
-SPECIAL_LEAVE_TYPES = {
-    "extended leave",
-    "unpaid leave",
-    "policy exception",
-}
 
 def create_approval_state(
-    leave_type,
-    requested_days,
-    daily_cost,
-):
-    estimated_cost = requested_days * daily_cost
+    leave_type: str, requested_days: int, daily_cost: float
+) -> dict[str, Any]:
+    """Validate the request and compute the existing manager-review rule."""
+    if not isinstance(leave_type, str) or not leave_type.strip():
+        raise ValueError("leave_type must be a nonempty string.")
+    if type(requested_days) is not int or requested_days <= 0:
+        raise ValueError("requested_days must be a positive whole number.")
+    if (
+        isinstance(daily_cost, bool)
+        or not isinstance(daily_cost, (int, float))
+        or not math.isfinite(daily_cost)
+        or daily_cost < 0
+    ):
+        raise ValueError("daily_cost must be a finite, nonnegative number.")
 
+    leave_type = leave_type.strip()
+    estimated_cost = round(requested_days * daily_cost, 2)
+    if not math.isfinite(estimated_cost):
+        raise ValueError("The estimated cost is too large.")
     reasons = []
-
     if estimated_cost >= APPROVAL_COST_THRESHOLD:
         reasons.append(
             f"Estimated cost ${estimated_cost:,.2f} meets or exceeds "
             f"the ${APPROVAL_COST_THRESHOLD:,.2f} approval threshold."
         )
-
     if leave_type.lower() in SPECIAL_LEAVE_TYPES:
         reasons.append(f"{leave_type} requires special manager approval.")
 
     return {
+        "leave_type": leave_type,
+        "requested_days": requested_days,
+        "daily_cost": daily_cost,
         "required": bool(reasons),
         "reason": " ".join(reasons),
         "estimated_cost": estimated_cost,
         "decision": "Pending" if reasons else "Not Required",
     }
 
-approval_state = create_approval_state(
-    leave_type="PTO",
-    requested_days=5,
-    daily_cost=320.00,
-)
 
-def alert_manager(approval_state):
-    """Display the approval alert in the shared console."""
+@dataclass
+class WorkflowState:
+    """State owned by one workflow, rather than a module-level variable."""
 
-    print("\n" + "=" * 70)
-    print("Manager Approval Needed - Task Paused")
-    print(f"Reason: {approval_state['reason']}")
-    print(
-        f"Estimated financial impact: "
-        f"${approval_state['estimated_cost']:,.2f}"
-    )
-    print("=" * 70)
+    approval_state: dict[str, Any] = field(default_factory=dict)
+    hr_policy_passed: bool | None = None
+    outcome: str = "Pending"
+    stop_reason: str = ""
 
-class ManagerApprovalAgent(UserProxyAgent):
-    """Human-in-the-loop approval agent."""
+    def create_and_save_approval_state(
+        self, leave_type: str, requested_days: int, daily_cost: float
+    ) -> str:
+        """Save supplied leave details and return the manager-review requirement.
 
-    def __init__(self, approval_state):
-        self.approval_state = approval_state
+        Saving a request does not approve it. Do not guess missing arguments.
+        """
+        new_state = create_approval_state(leave_type, requested_days, daily_cost)
+        if self.approval_state:
+            fields = ("leave_type", "requested_days", "daily_cost")
+            if any(self.approval_state[key] != new_state[key] for key in fields):
+                raise ValueError("A different request is already saved in this workflow.")
+            # An identical retry must not reset a manager's decision.
+        else:
+            self.approval_state.update(new_state)
+        return json.dumps({"saved": True, "approval_state": self.approval_state})
 
-        super().__init__(
-            name="Manager_Approver",
-            description=(
-                "A human manager who approves or rejects requests that "
-                "exceed an expense threshold or require special approval."
-            ),
-            human_input_mode="ALWAYS",
-            code_execution_config=False,
-            llm_config=False,
-        )
 
-    def get_human_input(self, prompt, iostream=None, **kwargs):
-
-        _ = (prompt, kwargs)
-        alert_manager(self.approval_state)
-
-        read_input = iostream.input if iostream is not None else input
-
-        while True:
-            decision = read_input(
-                "Manager decision—type APPROVE or REJECT: "
-            ).strip().lower()
-
-            if decision in {"approve", "approved", "a"}:
-                self.approval_state["decision"] = "Approved"
-
-                return (
-                    "[From: Manager]"
-                    "[Task: Approve Leave Expense]"
-                    "[Status: Approved]"
-                    "[Next: End]\n"
-                    "The manager approved the leave request and its "
-                    "financial impact."
-                )
-
-            if decision in {"reject", "rejected", "r"}:
-                self.approval_state["decision"] = "Rejected"
-
-                return (
-                    "[From: Manager]"
-                    "[Task: Approve Leave Expense]"
-                    "[Status: Rejected]"
-                    "[Next: End]\n"
-                    "The manager rejected the leave request based on its "
-                    "financial impact."
-                )
-
-            print("Invalid response. Please type APPROVE or REJECT.")
-
-manager_approver = ManagerApprovalAgent(approval_state)
-
-hr_assistant = AssistantAgent(
-    name="HR_Assistant",
-    description=(
-        "HR Assistant handles employee questions, HR policy information, "
-        "policy-management requests, and employee leave requests."
-    ),
-    system_message="""
+HR_SYSTEM_MESSAGE = """
 You are HR_Assistant in a sequential leave-processing workflow.
+The employee's submitted request is already confirmed. Do not ask the employee
+to confirm it again.
 
-The employee's submitted request is already confirmed. Do not ask the
-employee to confirm it again.
+1. Read the employee's request and supplied workflow data. Identify leave_type,
+   requested_days, daily_cost, requested hours, available PTO, and leave policy.
+   Do not invent values. Convert hours to days only using supplied working
+   hours per day. The current tool accepts positive whole days only; if a
+   request cannot be represented exactly, report it as blocked.
 
-Your responsibilities:
-1. Check the requested hours against the available PTO balance.
-2. Apply the supplied leave policy.
-3. Record whether the HR policy check passed.
-4. Forward the raw financial information to Finance_Assistant.
-5. Do not calculate cost or budget impact; Finance performs that work.
+2. Check requested hours against available PTO and apply the supplied policy.
+   Determine whether the HR policy check PASSED or FAILED and explain why.
 
-STRICT RESPONSE CONTRACT:
-- The first character of your response must be "[".
-- Do not place a greeting, introduction, or Markdown before the header.
-- Begin with this exact line:
+3. If the HR check passes and the required data is available, make an actual
+   call to create_and_save_approval_state with leave_type, requested_days,
+   and the supplied daily_cost. Merely mentioning the function is not a call.
+   Do not repeat a successful call for this request. Read the tool result.
+   Report the state as saved only if the tool confirms success.
 
+4. Forward the raw financial information to Finance_Assistant. Do not calculate
+   total cost or budget impact yourself. The Python tool computes the canonical
+   manager-review threshold; Finance prepares the financial report.
+
+FINAL TEXT CONTRACT (applies after tool execution, not to tool-call events):
+The first character must be "[". No greeting or Markdown before the header.
+
+After a passed HR check and a successful tool call, begin exactly with:
 [From: HR][Task: Approve Leave][Status: Complete][Next: Finance]
 
-- Include the HR decision and the raw information Finance needs.
-- End with this exact sentence:
+Include this exact line:
+HR policy check: PASSED
 
+Include the policy reason, leave type, requested days and hours, available PTO,
+supplied daily cost, department budget, and other raw data Finance needs.
+End with this exact sentence:
 HR complete, please continue.
-""",
-    llm_config=llm_config,
-)
 
-finance_assistant = AssistantAgent(
-    name="Finance_Assistant",
-    description=(
-        "A Finance assistant that handles budget queries, "
-        "expense reports, and financial summaries."
-    ),
-    system_message=f"""
+If the supplied policy check fails, begin exactly with:
+[From: HR][Task: Approve Leave][Status: Rejected][Next: End]
+Include this exact line:
+HR policy check: FAILED
+Explain the policy failure. Do not send a failed HR request to Finance.
+
+If data is missing, ambiguous, or a tool call fails, begin exactly with:
+[From: HR][Task: Approve Leave][Status: Blocked][Next: None]
+Identify the missing information or error. Ask only for missing facts, not
+reconfirmation. Do not claim completion or use the completion sentence.
+""".strip()
+
+FINANCE_SYSTEM_MESSAGE = f"""
 You are Finance_Assistant in a sequential leave-processing workflow.
+Use the supplied request and HR handoff to report requested leave days,
+the supplied daily employee cost, total cost, and budget remaining afterward.
+Do not invent missing financial data. The saved tool result contains the
+canonical estimated cost and manager-review requirement.
 
-Calculate:
-- Requested paid-leave days
-- Daily employee cost
-- Total estimated cost
-- Budget remaining after the cost
+Manager review is required when the estimated cost is at least
+${APPROVAL_COST_THRESHOLD:,.2f}, or for extended leave, unpaid leave, or a
+policy exception. Do not approve or reject requests requiring human review.
 
-Manager approval is required when:
-- Estimated cost is at least ${APPROVAL_COST_THRESHOLD:,.2f}; or
-- The request is a special leave or policy exception.
+If financial data is missing or contradictory, begin exactly with:
+[From: Finance][Task: Calculate Leave Impact][Status: Blocked][Next: None]
+Explain what is needed; do not claim completion.
 
-If approval is required, begin exactly with:
-
+Otherwise begin with the appropriate header:
 [From: Finance][Task: Calculate Leave Impact][Status: Approval Required][Next: Manager]
-
-Include the calculation and this exact line:
-
-Manager Approval Needed - Task Paused
-
-If approval is not required, begin exactly with:
-
+or:
 [From: Finance][Task: Calculate Leave Impact][Status: Complete][Next: End]
 
-Do not approve or reject requests requiring human approval.
-Do not place any greeting or Markdown before the structured header.
-""",
-    llm_config=llm_config,
-)
+Then provide your financial report. The application applies the final routing
+header using the saved Python state. Do not add a greeting or Markdown before
+the header. Do not ask the employee to confirm the request again.
+""".strip()
 
-employee = UserProxyAgent(
-    name="Employee",
-    description=(
-        "Submits the initial leave request."
-    ),
-    human_input_mode="NEVER",
-    code_execution_config=False,
-    llm_config=False,
-)
 
-def select_next_speaker(last_speaker, groupchat):
-    content = str(groupchat.messages[-1].get("content", "")).strip()
+class FinanceProtocolAgent(BaseChatAgent):
+    """Replace the legacy send hook using AgentChat's custom-agent interface."""
 
-    try:
-        labels = parse_labels(content)
-    except ValueError as error:
-        print(
-            f"\nWORKFLOW STOPPED: {last_speaker.name} returned "
-            f"an incorrectly formatted message.\n{error}"
+    def __init__(self, model_client: ChatCompletionClient, state: WorkflowState):
+        super().__init__(
+            name="Finance_Assistant",
+            description="Reports leave costs and routes required human approvals.",
         )
-        return None
-
-    if last_speaker is employee:
-        if labels["next_agent"] != "HR":
-            print("WORKFLOW STOPPED: Employee must assign the task to HR.")
-            return None
-
-        return hr_assistant
-
-    if last_speaker is hr_assistant:
-        valid_handoff = (
-            labels["sender"] == "HR"
-            and labels["status"] == "Complete"
-            and labels["next_agent"] == "Finance"
-            and "HR complete, please continue." in content
+        self._state = state
+        self._assistant = AssistantAgent(
+            name=self.name,
+            model_client=model_client,
+            system_message=FINANCE_SYSTEM_MESSAGE,
         )
 
-        if not valid_handoff:
-            print("WORKFLOW STOPPED: Invalid HR-to-Finance handoff.")
-            return None
+    @property
+    def produced_message_types(self) -> Sequence[type[BaseChatMessage]]:
+        return [TextMessage]
 
-        return finance_assistant
+    async def on_messages(
+        self, messages: Sequence[BaseChatMessage], cancellation_token: CancellationToken
+    ) -> Response:
+        state = self._state.approval_state
+        if not state or self._state.hr_policy_passed is not True:
+            raise WorkflowError("Finance requires a saved request and a passed HR check.")
 
-    if last_speaker is finance_assistant:
-        if approval_state["required"]:
-            expected_handoff = (
-                labels["sender"] == "Finance"
-                and labels["status"] == "Approval Required"
-                and labels["next_agent"] == "Manager"
+        response = await self._assistant.on_messages(messages, cancellation_token)
+        message = response.chat_message
+        if not isinstance(message, TextMessage):
+            raise WorkflowError("Finance must return a text report.")
+
+        # Preserve an explicit blocked result; do not turn an error into success.
+        match = LABEL_PATTERN.match(message.content)
+        if match and match.group("status").strip() == "Blocked":
+            return response
+
+        body = LABEL_PATTERN.sub("", message.content, count=1).strip()
+        if not body:
+            raise WorkflowError("Finance returned an empty report.")
+        if state["required"]:
+            header = (
+                "[From: Finance][Task: Calculate Leave Impact]"
+                "[Status: Approval Required][Next: Manager]"
             )
+            if PAUSE_MESSAGE not in body:
+                body = f"{body}\n\n{PAUSE_MESSAGE}"
+        else:
+            header = (
+                "[From: Finance][Task: Calculate Leave Impact]"
+                "[Status: Complete][Next: End]"
+            )
+            body = body.replace(PAUSE_MESSAGE, "").strip()
 
-            if not expected_handoff:
-                print(
-                    "PROTOCOL WARNING: Finance supplied an incorrect routing "
-                    "label. The deterministic approval rule overrode it."
-                )
-
-            return manager_approver
-
-        valid_completion = (
-            labels["sender"] == "Finance"
-            and labels["status"] == "Complete"
-            and labels["next_agent"] == "End"
+        return Response(
+            chat_message=message.model_copy(update={"content": f"{header}\n{body}"}),
+            inner_messages=response.inner_messages,
         )
 
-        if not valid_completion:
-            print("WORKFLOW STOPPED: Invalid Finance completion message.")
-            return None
+    async def on_reset(self, cancellation_token: CancellationToken) -> None:
+        await self._assistant.on_reset(cancellation_token)
 
-    if last_speaker is manager_approver:
-        valid_decision = (
-            labels["sender"] == "Manager"
-            and labels["status"] in {"Approved", "Rejected"}
-            and labels["next_agent"] == "End"
-        )
 
-        if not valid_decision:
-            print("WORKFLOW STOPPED: Invalid manager decision.")
-            return None
-
-        print(f"\nFinal manager decision: {labels['status']}")
-        return None
-
-    return None
-
-workflow_chat = GroupChat(
-    agents=[
-        employee,
-        hr_assistant,
-        finance_assistant,
-        manager_approver,
-    ],
-    messages=[],
-    max_round=5,
-    speaker_selection_method=select_next_speaker,
-    allow_repeat_speaker=False,
-    send_introductions=True,
-)
-
-workflow_manager = GroupChatManager(
-    name="Workflow_Manager",
-    groupchat=workflow_chat,
-    llm_config=llm_config,
-)
-
-WORKFLOW_HEADER_PATTERN = re.compile(
-    r"\[From:[^\]]+\]"
-    r"\[Task:[^\]]+\]"
-    r"\[Status:[^\]]+\]"
-    r"\[Next:[^\]]+\]\s*",
-    re.IGNORECASE,
-)
-
-def enforce_finance_protocol(sender, message, recipient, silent):
-    """
-    Deterministically apply Finance's workflow labels before its
-    response reaches Workflow_Manager.
-    """
-
-    if isinstance(message, dict):
-        original_content = str(message.get("content", ""))
-    else:
-        original_content = str(message)
-
-    body = WORKFLOW_HEADER_PATTERN.sub(
-        "",
-        original_content,
-        count=1,
-    ).strip()
-
-    pause_message = "Manager Approval Needed - Task Paused"
-
-    if approval_state["required"]:
-        header = (
-            "[From: Finance]"
-            "[Task: Calculate Leave Impact]"
-            "[Status: Approval Required]"
-            "[Next: Manager]"
-        )
-
-        if pause_message not in body:
-            body = f"{body}\n\n{pause_message}"
-
-    else:
-        header = (
-            "[From: Finance]"
-            "[Task: Calculate Leave Impact]"
-            "[Status: Complete]"
-            "[Next: End]"
-        )
-
-        body = body.replace(pause_message, "").strip()
-
-    corrected_content = f"{header}\n{body}"
-
-    if isinstance(message, dict):
-        corrected_message = dict(message)
-        corrected_message["content"] = corrected_content
-        return corrected_message
-
-    return corrected_content
-
-finance_assistant.register_hook(
-    "process_message_before_send",
-    enforce_finance_protocol,
-)
-
-employee.initiate_chat(
-    recipient=workflow_manager,
-    message="""
+EXAMPLE_REQUEST = """
 [From: Employee][Task: Submit Leave][Status: Ready][Next: HR]
 I am requesting 40 hours of paid leave from September 14 through
 September 18, 2026.
 
+Leave type: paid leave
+Requested paid-leave days: 5
+Working hours per day: 8
 Available PTO balance: 80 hours
 Daily employee cost: $320
 Department leave-impact budget remaining: $10,000
 
 Applicable policy: Requests of 12 days or fewer may be approved when
 the employee has enough available PTO.
-""".strip(),
-)
+""".strip()
+
+
+class LeaveWorkflow:
+    """One request, its three participants, and its deterministic routing."""
+
+    def __init__(
+        self,
+        model_client: ChatCompletionClient,
+        *,
+        read_manager_input: Callable[[str], str] = input,
+    ):
+        self.state = WorkflowState()
+        self._read_manager_input = read_manager_input
+        self._started = False
+        self.hr_assistant = AssistantAgent(
+            name="HR_Assistant",
+            description="Checks leave policy and saves the request using its tool.",
+            model_client=model_client,
+            system_message=HR_SYSTEM_MESSAGE,
+            tools=[self.state.create_and_save_approval_state],
+            reflect_on_tool_use=True,
+            max_tool_iterations=1,
+        )
+        self.finance_assistant = FinanceProtocolAgent(model_client, self.state)
+        self.manager_approver = UserProxyAgent(
+            name="Manager_Approver",
+            description="A human manager who approves or rejects flagged requests.",
+            input_func=self._manager_input,
+        )
+
+        # This team replaces BOTH GroupChat and GroupChatManager.
+        # The selector always returns an agent name; it never delegates routing
+        # to an LLM by returning None. FunctionalTermination handles stopping.
+        self.team = SelectorGroupChat(
+            participants=[
+                self.hr_assistant, self.finance_assistant, self.manager_approver
+            ],
+            model_client=model_client,
+            selector_func=self.select_next_speaker,
+            termination_condition=FunctionalTermination(self.should_stop),
+            max_turns=6,
+            allow_repeated_speaker=False,
+        )
+
+    def _manager_input(self, prompt: str) -> str:
+        state = self.state.approval_state
+        if (
+            not state
+            or not state["required"]
+            or self.state.hr_policy_passed is not True
+        ):
+            raise WorkflowError("No eligible request requires manager approval.")
+        print(f"\n{PAUSE_MESSAGE}")
+        print(f"Reason: {state['reason']}")
+        print(f"Estimated financial impact: ${state['estimated_cost']:,.2f}")
+        while True:
+            answer = self._read_manager_input(
+                "Manager decision—type APPROVE or REJECT: "
+            ).strip().lower()
+            if answer in {"approve", "approved", "a"}:
+                decision = "Approved"
+            elif answer in {"reject", "rejected", "r"}:
+                decision = "Rejected"
+            else:
+                print("Invalid response. Please type APPROVE or REJECT.")
+                continue
+            state["decision"] = decision
+            return (
+                "[From: Manager][Task: Approve Leave Expense]"
+                f"[Status: {decision}][Next: End]\n"
+                f"The manager {decision.lower()} the request and its financial impact."
+            )
+
+    def _route(self, messages: Sequence[BaseAgentEvent | BaseChatMessage]) -> str | None:
+        # ToolCallRequestEvent, ToolCallExecutionEvent and input-request events
+        # are not final chat messages and have no [From: ...] text contract.
+        last = next(
+            (item for item in reversed(messages) if isinstance(item, BaseChatMessage)),
+            None,
+        )
+        if not isinstance(last, TextMessage):
+            raise WorkflowError("Expected a final text message for workflow routing.")
+        labels = parse_labels(last.content)
+
+        expected_senders = {
+            "Employee": "Employee",
+            "HR_Assistant": "HR",
+            "Finance_Assistant": "Finance",
+            "Manager_Approver": "Manager",
+        }
+        if last.source not in expected_senders or labels["sender"] != expected_senders[last.source]:
+            raise WorkflowError("The message's From label does not match its actual source.")
+
+        if last.source == "Employee":
+            if labels["status"] != "Ready" or labels["next_agent"] != "HR":
+                raise WorkflowError("The employee request must be Ready and assigned to HR.")
+            return "HR_Assistant"
+
+        if last.source in {"HR_Assistant", "Finance_Assistant"} and labels["status"] == "Blocked":
+            if labels["next_agent"] != "None":
+                raise WorkflowError("A blocked request must use [Next: None].")
+            self.state.outcome = "Blocked"
+            self.state.stop_reason = f"{last.source} needs missing information or a correction."
+            return None
+
+        if last.source == "HR_Assistant":
+            policy_lines = HR_POLICY_PATTERN.findall(last.content)
+            if len(policy_lines) != 1:
+                raise WorkflowError("HR must supply exactly one HR policy check: PASSED/FAILED line.")
+            self.state.hr_policy_passed = policy_lines[0] == "PASSED"
+            if not self.state.hr_policy_passed:
+                self.state.outcome = "Rejected by HR"
+                self.state.stop_reason = "The HR policy check failed; Finance was not run."
+                return None
+            if (
+                labels["status"] != "Complete"
+                or labels["next_agent"] != "Finance"
+                or not last.content.rstrip().endswith(HR_COMPLETE_SENTENCE)
+            ):
+                raise WorkflowError("Invalid HR-to-Finance handoff.")
+            if not self.state.approval_state:
+                raise WorkflowError("HR did not successfully execute create_and_save_approval_state.")
+            return "Finance_Assistant"
+
+        if last.source == "Finance_Assistant":
+            state = self.state.approval_state
+            if not state or self.state.hr_policy_passed is not True:
+                raise WorkflowError("Finance requires a saved request and a passed HR check.")
+            if state["required"]:
+                if labels["status"] != "Approval Required" or labels["next_agent"] != "Manager":
+                    raise WorkflowError("Finance must route this request to the manager.")
+                return "Manager_Approver"
+            if labels["status"] != "Complete" or labels["next_agent"] != "End":
+                raise WorkflowError("Invalid Finance completion message.")
+            self.state.outcome = "Completed"
+            self.state.stop_reason = "HR and Finance completed; manager approval was not required."
+            return None
+
+        if last.source == "Manager_Approver":
+            state = self.state.approval_state
+            if (
+                not state
+                or not state["required"]
+                or labels["status"] not in {"Approved", "Rejected"}
+                or labels["next_agent"] != "End"
+                or state["decision"] != labels["status"]
+            ):
+                raise WorkflowError("The manager message does not match the recorded human decision.")
+            self.state.outcome = state["decision"]
+            self.state.stop_reason = f"Final manager decision: {state['decision']}."
+            return None
+
+        raise WorkflowError("No valid next step exists for this message.")
+
+    def should_stop(self, messages: Sequence[BaseAgentEvent | BaseChatMessage]) -> bool:
+        try:
+            return self._route(messages) is None
+        except WorkflowError as error:
+            self.state.outcome = "Blocked"
+            self.state.stop_reason = str(error)
+            return True
+
+    def select_next_speaker(self, messages: Sequence[BaseAgentEvent | BaseChatMessage]) -> str:
+        next_speaker = self._route(messages)
+        if next_speaker is None:
+            # In 0.7.5, returning None would invoke model-based selection.
+            raise WorkflowError("The termination condition should have stopped this workflow.")
+        return next_speaker
+
+    async def run(self, request_text: str = EXAMPLE_REQUEST, *, show_console: bool = True) -> TaskResult:
+        if self._started:
+            raise RuntimeError("Create a new LeaveWorkflow for each new request.")
+        self._started = True
+        # Employee no longer needs a UserProxyAgent or initiate_chat().
+        task = TextMessage(source="Employee", content=request_text.strip())
+        if show_console:
+            result = await Console(self.team.run_stream(task=task))
+        else:
+            result = await self.team.run(task=task)
+        if self.state.outcome == "Pending":
+            self.state.outcome = "Blocked"
+            self.state.stop_reason = result.stop_reason or "The team stopped before completion."
+        return result
+
+
+def create_model_client() -> AzureOpenAIChatCompletionClient:
+    """Replace llm_config with the newer Azure model-client configuration."""
+    load_dotenv(Path(__file__).with_name(".env"))
+    api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+    api_version = os.getenv("API_VERSION") or os.getenv("AZURE_OPENAI_API_VERSION")
+    required = {
+        "AZURE_OPENAI_API_KEY": api_key,
+        "AZURE_OPENAI_ENDPOINT": endpoint,
+        "AZURE_OPENAI_DEPLOYMENT": deployment,
+        "API_VERSION (or AZURE_OPENAI_API_VERSION)": api_version,
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise RuntimeError("Missing configuration in the environment or adjacent .env: " + ", ".join(missing))
+
+    # A custom Azure deployment alias may not be a recognized model name.
+    model_name = os.getenv("AZURE_OPENAI_MODEL") or deployment
+    try:
+        return AzureOpenAIChatCompletionClient(
+            azure_endpoint=endpoint,
+            azure_deployment=deployment,
+            api_key=api_key,
+            api_version=api_version,
+            model=model_name,
+        )
+    except ValueError as error:
+        if "model_info is required" in str(error):
+            raise RuntimeError(
+                "Set AZURE_OPENAI_MODEL to the underlying model name, "
+                "rather than a custom Azure deployment alias."
+            ) from error
+        raise
+
+
+async def main() -> None:
+    model_client = create_model_client()
+    try:
+        workflow = LeaveWorkflow(model_client)
+        await workflow.run(EXAMPLE_REQUEST)
+        print(f"\nWorkflow outcome: {workflow.state.outcome}")
+        print(workflow.state.stop_reason)
+        print("Saved approval state:")
+        print(json.dumps(workflow.state.approval_state, indent=2))
+    finally:
+        await model_client.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
