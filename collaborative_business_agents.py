@@ -92,7 +92,6 @@ def create_approval_state(
 
 @dataclass
 class WorkflowState:
-    """State owned by one workflow, rather than a module-level variable."""
 
     approval_state: dict[str, Any] = field(default_factory=dict)
     hr_policy_passed: bool | None = None
@@ -194,8 +193,7 @@ the header. Do not ask the employee to confirm the request again.
 
 
 class FinanceProtocolAgent(BaseChatAgent):
-    """Replace the legacy send hook using AgentChat's custom-agent interface."""
-
+    
     def __init__(self, model_client: ChatCompletionClient, state: WorkflowState):
         super().__init__(
             name="Finance_Assistant",
@@ -300,9 +298,6 @@ class LeaveWorkflow:
             input_func=self._manager_input,
         )
 
-        # This team replaces BOTH GroupChat and GroupChatManager.
-        # The selector always returns an agent name; it never delegates routing
-        # to an LLM by returning None. FunctionalTermination handles stopping.
         self.team = SelectorGroupChat(
             participants=[
                 self.hr_assistant, self.finance_assistant, self.manager_approver
@@ -344,8 +339,7 @@ class LeaveWorkflow:
             )
 
     def _route(self, messages: Sequence[BaseAgentEvent | BaseChatMessage]) -> str | None:
-        # ToolCallRequestEvent, ToolCallExecutionEvent and input-request events
-        # are not final chat messages and have no [From: ...] text contract.
+        
         last = next(
             (item for item in reversed(messages) if isinstance(item, BaseChatMessage)),
             None,
@@ -435,7 +429,6 @@ class LeaveWorkflow:
     def select_next_speaker(self, messages: Sequence[BaseAgentEvent | BaseChatMessage]) -> str:
         next_speaker = self._route(messages)
         if next_speaker is None:
-            # In 0.7.5, returning None would invoke model-based selection.
             raise WorkflowError("The termination condition should have stopped this workflow.")
         return next_speaker
 
@@ -443,7 +436,6 @@ class LeaveWorkflow:
         if self._started:
             raise RuntimeError("Create a new LeaveWorkflow for each new request.")
         self._started = True
-        # Employee no longer needs a UserProxyAgent or initiate_chat().
         task = TextMessage(source="Employee", content=request_text.strip())
         if show_console:
             result = await Console(self.team.run_stream(task=task))
@@ -472,7 +464,6 @@ def create_model_client() -> AzureOpenAIChatCompletionClient:
     if missing:
         raise RuntimeError("Missing configuration in the environment or adjacent .env: " + ", ".join(missing))
 
-    # A custom Azure deployment alias may not be a recognized model name.
     model_name = os.getenv("AZURE_OPENAI_MODEL") or deployment
     try:
         return AzureOpenAIChatCompletionClient(
