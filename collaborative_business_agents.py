@@ -1,24 +1,3 @@
-"""Leave-processing workflow for Microsoft AutoGen 0.7.5.
-
-Install in the Python environment used to run this file:
-    python -m pip install "autogen-agentchat==0.7.5" "autogen-ext[openai]==0.7.5" python-dotenv
-
-Keep a .env file beside this script containing:
-    AZURE_OPENAI_API_KEY=<your key>
-    AZURE_OPENAI_ENDPOINT=<your Azure OpenAI resource endpoint>
-    AZURE_OPENAI_DEPLOYMENT=<your deployment name>
-    API_VERSION=<the API version for your deployment>
-    AZURE_OPENAI_MODEL=<the underlying model name, if different from deployment>
-
-AZURE_OPENAI_API_VERSION is also accepted when API_VERSION is not supplied.
-Use a deployment that supports tool calling. Deployment names and model names
-are different concepts: a deployment named hr-model might host gpt-4o.
-
-Create a new LeaveWorkflow instance for each employee request. The request's
-state is available as workflow.state.approval_state after await workflow.run().
-This is an in-memory console example; it does not update an HR database.
-"""
-
 import asyncio
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
