@@ -269,7 +269,6 @@ the employee has enough available PTO.
 
 
 class LeaveWorkflow:
-    """One request, its three participants, and its deterministic routing."""
 
     def __init__(
         self,
@@ -446,7 +445,6 @@ class LeaveWorkflow:
 
 
 def create_model_client() -> AzureOpenAIChatCompletionClient:
-    """Replace llm_config with the newer Azure model-client configuration."""
     load_dotenv(Path(__file__).with_name(".env"))
     api_key = os.getenv("AZURE_OPENAI_API_KEY")
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
